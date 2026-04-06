@@ -6,14 +6,6 @@
  * LICENSE-AGPL for a copy of the license.
  */
 
-//! Secret backend extension for the API layer
-//!
-//! This module provides helper functions for integrating the SecretBackend
-//! trait with variable operations in the API.
-//!
-//! Note: HashiCorp Vault integration requires Enterprise Edition.
-//! The OSS version only supports the database backend.
-
 use std::sync::Arc;
 
 use windmill_common::{
@@ -26,14 +18,15 @@ use windmill_common::{
 #[cfg(all(feature = "private", feature = "enterprise"))]
 use windmill_common::{
     global_settings::{load_value_from_global_settings, SECRET_BACKEND_SETTING},
-    secret_backend::{AzureKeyVaultBackend, AzureKeyVaultSettings, SecretBackendConfig, VaultBackend, VaultSettings},
+    secret_backend::{
+        AwsSecretsManagerBackend, AwsSecretsManagerSettings, AzureKeyVaultBackend,
+        AzureKeyVaultSettings, SecretBackendConfig, VaultBackend, VaultSettings,
+    },
 };
 
 #[cfg(all(feature = "private", feature = "enterprise"))]
 use tokio::sync::RwLock;
 
-// Cached Vault backend to avoid recreating it for every request
-// This enables connection pooling and avoids repeated setup overhead
 #[cfg(all(feature = "private", feature = "enterprise"))]
 struct CachedVaultBackend {
     backend: Arc<dyn SecretBackend>,
@@ -56,10 +49,17 @@ lazy_static::lazy_static! {
     static ref AZURE_KV_BACKEND_CACHE: RwLock<Option<CachedAzureKvBackend>> = RwLock::new(None);
 }
 
-/// Get the current secret backend based on global settings
-///
-/// OSS: Always returns DatabaseBackend
-/// EE: Returns configured backend (Database or Vault)
+#[cfg(all(feature = "private", feature = "enterprise"))]
+struct CachedAwsSmBackend {
+    backend: Arc<dyn SecretBackend>,
+    settings: AwsSecretsManagerSettings,
+}
+
+#[cfg(all(feature = "private", feature = "enterprise"))]
+lazy_static::lazy_static! {
+    static ref AWS_SM_BACKEND_CACHE: RwLock<Option<CachedAwsSmBackend>> = RwLock::new(None);
+}
+
 #[cfg(not(all(feature = "private", feature = "enterprise")))]
 pub async fn get_secret_backend(db: &DB) -> Result<Arc<dyn SecretBackend>> {
     Ok(Arc::new(DatabaseBackend::new(db.clone())))
@@ -80,16 +80,17 @@ pub async fn get_secret_backend(db: &DB) -> Result<Arc<dyn SecretBackend>> {
         SecretBackendConfig::AzureKeyVault(settings) => {
             get_or_create_azure_kv_backend(db, settings).await
         }
+        SecretBackendConfig::AwsSecretsManager(settings) => {
+            get_or_create_aws_sm_backend(db, settings).await
+        }
     }
 }
 
-/// Get a cached Vault backend or create a new one if settings changed
 #[cfg(all(feature = "private", feature = "enterprise"))]
 async fn get_or_create_vault_backend(
     _db: &DB,
     settings: VaultSettings,
 ) -> Result<Arc<dyn SecretBackend>> {
-    // Check if we have a cached backend with matching settings (read lock)
     {
         let cache = VAULT_BACKEND_CACHE.read().await;
         if let Some(ref cached) = *cache {
@@ -98,18 +99,12 @@ async fn get_or_create_vault_backend(
             }
         }
     }
-
-    // Need to create a new backend - acquire write lock
     let mut cache = VAULT_BACKEND_CACHE.write().await;
-
-    // Double-check (another task may have created it while we waited)
     if let Some(ref cached) = *cache {
         if cached.settings == settings {
             return Ok(cached.backend.clone());
         }
     }
-
-    // Create new backend
     let backend: Arc<dyn SecretBackend> = {
         #[cfg(feature = "openidconnect")]
         if settings.token.is_none() {
@@ -117,24 +112,18 @@ async fn get_or_create_vault_backend(
         } else {
             Arc::new(VaultBackend::new(settings.clone()))
         }
-
         #[cfg(not(feature = "openidconnect"))]
         Arc::new(VaultBackend::new(settings.clone()))
     };
-
-    // Cache it
     *cache = Some(CachedVaultBackend { backend: backend.clone(), settings });
-
     Ok(backend)
 }
 
-/// Get a cached Azure Key Vault backend or create a new one if settings changed
 #[cfg(all(feature = "private", feature = "enterprise"))]
 async fn get_or_create_azure_kv_backend(
     _db: &DB,
     settings: AzureKeyVaultSettings,
 ) -> Result<Arc<dyn SecretBackend>> {
-    // Check if we have a cached backend with matching settings (read lock)
     {
         let cache = AZURE_KV_BACKEND_CACHE.read().await;
         if let Some(ref cached) = *cache {
@@ -143,30 +132,42 @@ async fn get_or_create_azure_kv_backend(
             }
         }
     }
-
-    // Need to create a new backend - acquire write lock
     let mut cache = AZURE_KV_BACKEND_CACHE.write().await;
-
-    // Double-check (another task may have created it while we waited)
     if let Some(ref cached) = *cache {
         if cached.settings == settings {
             return Ok(cached.backend.clone());
         }
     }
-
-    // Create new backend
     let backend: Arc<dyn SecretBackend> = Arc::new(AzureKeyVaultBackend::new(settings.clone()));
-
-    // Cache it
     *cache = Some(CachedAzureKvBackend { backend: backend.clone(), settings });
-
     Ok(backend)
 }
 
-/// Check if a Vault backend is currently configured
-///
-/// OSS: Always returns false
-/// EE: Checks global settings
+#[cfg(all(feature = "private", feature = "enterprise"))]
+async fn get_or_create_aws_sm_backend(
+    _db: &DB,
+    settings: AwsSecretsManagerSettings,
+) -> Result<Arc<dyn SecretBackend>> {
+    {
+        let cache = AWS_SM_BACKEND_CACHE.read().await;
+        if let Some(ref cached) = *cache {
+            if cached.settings == settings {
+                return Ok(cached.backend.clone());
+            }
+        }
+    }
+    let mut cache = AWS_SM_BACKEND_CACHE.write().await;
+    if let Some(ref cached) = *cache {
+        if cached.settings == settings {
+            return Ok(cached.backend.clone());
+        }
+    }
+    let backend: Arc<dyn SecretBackend> =
+        Arc::new(AwsSecretsManagerBackend::new_with_client(settings.clone()).await?);
+    *cache = Some(CachedAwsSmBackend { backend: backend.clone(), settings });
+    Ok(backend)
+}
+
 #[cfg(not(all(feature = "private", feature = "enterprise")))]
 pub async fn is_vault_backend_configured(_db: &DB) -> Result<bool> {
     Ok(false)
@@ -178,14 +179,14 @@ pub async fn is_vault_backend_configured(db: &DB) -> Result<bool> {
         Some(value) => serde_json::from_value::<SecretBackendConfig>(value).unwrap_or_default(),
         None => SecretBackendConfig::default(),
     };
-
-    Ok(matches!(config, SecretBackendConfig::HashiCorpVault(_) | SecretBackendConfig::AzureKeyVault(_)))
+    Ok(matches!(
+        config,
+        SecretBackendConfig::HashiCorpVault(_)
+            | SecretBackendConfig::AzureKeyVault(_)
+            | SecretBackendConfig::AwsSecretsManager(_)
+    ))
 }
 
-/// Get a secret value using the configured backend
-///
-/// For database backend: decrypts using workspace key
-/// For vault backend (EE only): fetches from Vault directly
 pub async fn get_secret_value(
     db: &DB,
     workspace_id: &str,
@@ -193,20 +194,14 @@ pub async fn get_secret_value(
     encrypted_value: &str,
 ) -> Result<String> {
     let backend = get_secret_backend(db).await?;
-
     match backend.backend_name() {
         "database" => {
-            // Use existing database decryption
             let mc = build_crypt(db, workspace_id).await?;
             decrypt(&mc, encrypted_value.to_string()).map_err(|e| {
                 Error::internal_err(format!("Error decrypting variable {}: {}", path, e))
             })
         }
-        "hashicorp_vault" => {
-            // Fetch from Vault directly
-            backend.get_secret(workspace_id, path).await
-        }
-        "azure_key_vault" => {
+        "hashicorp_vault" | "azure_key_vault" | "aws_secrets_manager" => {
             backend.get_secret(workspace_id, path).await
         }
         _ => Err(Error::internal_err(format!(
@@ -216,10 +211,6 @@ pub async fn get_secret_value(
     }
 }
 
-/// Store a secret value using the configured backend
-///
-/// For database backend: encrypts using workspace key and returns encrypted value
-/// For vault backend (EE only): stores in Vault and returns a placeholder for DB storage
 pub async fn store_secret_value(
     db: &DB,
     workspace_id: &str,
@@ -227,21 +218,22 @@ pub async fn store_secret_value(
     plain_value: &str,
 ) -> Result<String> {
     let backend = get_secret_backend(db).await?;
-
     match backend.backend_name() {
         "database" => {
-            // Use existing database encryption
             let mc = build_crypt(db, workspace_id).await?;
             Ok(encrypt(&mc, plain_value))
         }
         "hashicorp_vault" => {
-            // Store in Vault and return a marker for DB
             backend.set_secret(workspace_id, path, plain_value).await?;
             Ok(format!("$vault:{}", path))
         }
         "azure_key_vault" => {
             backend.set_secret(workspace_id, path, plain_value).await?;
             Ok(format!("$azure_kv:{}", path))
+        }
+        "aws_secrets_manager" => {
+            backend.set_secret(workspace_id, path, plain_value).await?;
+            Ok(format!("$aws_sm:{}", path))
         }
         _ => Err(Error::internal_err(format!(
             "Unknown backend: {}",
@@ -250,14 +242,9 @@ pub async fn store_secret_value(
     }
 }
 
-/// Delete a secret from the configured backend (if using Vault)
-///
-/// For database backend: no-op (DB delete is handled separately)
-/// For vault backend (EE only): deletes from Vault
 pub async fn delete_secret_from_backend(db: &DB, workspace_id: &str, path: &str) -> Result<()> {
     if is_vault_backend_configured(db).await? {
         let backend = get_secret_backend(db).await?;
-        // Ignore NotFound errors during deletion (secret might not exist in Vault)
         match backend.delete_secret(workspace_id, path).await {
             Ok(()) => Ok(()),
             Err(Error::NotFound(_)) => Ok(()),
@@ -268,22 +255,22 @@ pub async fn delete_secret_from_backend(db: &DB, workspace_id: &str, path: &str)
     }
 }
 
-/// Check if a value is stored in Vault (indicated by the $vault: prefix)
 pub fn is_vault_stored_value(value: &str) -> bool {
     value.starts_with("$vault:")
 }
 
-/// Check if a value is stored in Azure Key Vault (indicated by the $azure_kv: prefix)
 pub fn is_azure_kv_stored_value(value: &str) -> bool {
     value.starts_with("$azure_kv:")
 }
 
-/// Check if a value is stored in any external secret backend
-pub fn is_external_stored_value(value: &str) -> bool {
-    is_vault_stored_value(value) || is_azure_kv_stored_value(value)
+pub fn is_aws_sm_stored_value(value: &str) -> bool {
+    value.starts_with("$aws_sm:")
 }
 
-/// Rename a secret in Vault when a variable path changes (EE only)
+pub fn is_external_stored_value(value: &str) -> bool {
+    is_vault_stored_value(value) || is_azure_kv_stored_value(value) || is_aws_sm_stored_value(value)
+}
+
 #[cfg(not(all(feature = "private", feature = "enterprise")))]
 pub async fn rename_vault_secret(
     _db: &DB,
@@ -293,20 +280,13 @@ pub async fn rename_vault_secret(
     current_value: &str,
 ) -> Result<Option<String>> {
     if is_vault_stored_value(current_value) {
-        tracing::warn!(
-            "Variable has $vault: prefix but Vault requires Enterprise Edition. \
-             Updating DB reference to {}",
-            new_path
-        );
         return Ok(Some(format!("$vault:{}", new_path)));
     }
     if is_azure_kv_stored_value(current_value) {
-        tracing::warn!(
-            "Variable has $azure_kv: prefix but Azure Key Vault requires Enterprise Edition. \
-             Updating DB reference to {}",
-            new_path
-        );
         return Ok(Some(format!("$azure_kv:{}", new_path)));
+    }
+    if is_aws_sm_stored_value(current_value) {
+        return Ok(Some(format!("$aws_sm:{}", new_path)));
     }
     Ok(None)
 }
@@ -325,6 +305,8 @@ pub async fn rename_vault_secret(
 
     let marker_prefix = if current_value.starts_with("$azure_kv:") {
         "$azure_kv:"
+    } else if current_value.starts_with("$aws_sm:") {
+        "$aws_sm:"
     } else {
         "$vault:"
     };
@@ -333,9 +315,7 @@ pub async fn rename_vault_secret(
         tracing::warn!(
             "Variable value has {} prefix but external secret backend is not configured. \
              Updating DB reference from {} to {}",
-            marker_prefix,
-            old_path,
-            new_path
+            marker_prefix, old_path, new_path
         );
         return Ok(Some(format!("{}{}", marker_prefix, new_path)));
     }
@@ -347,31 +327,25 @@ pub async fn rename_vault_secret(
         Err(Error::NotFound(_)) => {
             tracing::warn!(
                 "Secret not found in backend at path {} during rename to {}",
-                old_path,
-                new_path
+                old_path, new_path
             );
             return Ok(Some(format!("{}{}", marker_prefix, new_path)));
         }
         Err(e) => return Err(e),
     };
 
-    backend
-        .set_secret(workspace_id, new_path, &secret_value)
-        .await?;
+    backend.set_secret(workspace_id, new_path, &secret_value).await?;
 
     if let Err(e) = backend.delete_secret(workspace_id, old_path).await {
         tracing::warn!(
             "Failed to delete old secret at {} after rename to {}: {}",
-            old_path,
-            new_path,
-            e
+            old_path, new_path, e
         );
     }
 
     Ok(Some(format!("{}{}", marker_prefix, new_path)))
 }
 
-/// Bulk rename secrets in Vault when a path prefix changes (e.g., user rename)
 #[cfg(not(all(feature = "private", feature = "enterprise")))]
 pub async fn rename_vault_secrets_with_prefix(
     _db: &DB,
@@ -405,6 +379,8 @@ pub async fn rename_vault_secrets_with_prefix(
 
         let marker_prefix = if value.starts_with("$azure_kv:") {
             "$azure_kv:"
+        } else if value.starts_with("$aws_sm:") {
+            "$aws_sm:"
         } else {
             "$vault:"
         };
@@ -422,33 +398,18 @@ pub async fn rename_vault_secrets_with_prefix(
                 continue;
             }
             Err(e) => {
-                tracing::error!(
-                    "Failed to read secret at {} during bulk rename: {}",
-                    old_path,
-                    e
-                );
+                tracing::error!("Failed to read secret at {} during bulk rename: {}", old_path, e);
                 continue;
             }
         };
 
-        if let Err(e) = backend
-            .set_secret(workspace_id, &new_path, &secret_value)
-            .await
-        {
-            tracing::error!(
-                "Failed to write secret to {} during bulk rename: {}",
-                new_path,
-                e
-            );
+        if let Err(e) = backend.set_secret(workspace_id, &new_path, &secret_value).await {
+            tracing::error!("Failed to write secret to {} during bulk rename: {}", new_path, e);
             continue;
         }
 
         if let Err(e) = backend.delete_secret(workspace_id, &old_path).await {
-            tracing::warn!(
-                "Failed to delete old secret at {} after rename: {}",
-                old_path,
-                e
-            );
+            tracing::warn!("Failed to delete old secret at {} after rename: {}", old_path, e);
         }
 
         updates.push((old_path, format!("{}{}", marker_prefix, new_path)));
