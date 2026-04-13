@@ -48,6 +48,9 @@ mod db_entra_ee;
 mod db_iam_ee;
 pub mod db_params;
 #[cfg(feature = "private")]
+pub mod deployment_requests_ee;
+pub mod deployment_requests_oss;
+#[cfg(feature = "private")]
 pub mod ee;
 pub mod ee_oss;
 #[cfg(feature = "private")]
